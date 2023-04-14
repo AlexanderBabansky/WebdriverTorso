@@ -228,7 +228,7 @@ int output_video(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
     if (pkt->dts < 0)
         pkt->dts = 0;
 
-    uint8_t* data = pkt->data;
+    uint8_t* data = NULL;
     int size = pkt->size;
     int ret = av_avc_parse_nal_units_buf(pkt->data, &data, &size);
 
@@ -360,9 +360,9 @@ int main() {
     parsed_url.key = "key";
     parsed_url.url = "127.0.0.1";
 
-    /*parsed_url.app = "live2";
+    parsed_url.app = "live2";
     parsed_url.key = "j0c0-v7xv-4kmb-gtu7-5r5p";
-    parsed_url.url = "a.rtmp.youtube.com";*/
+    parsed_url.url = "a.rtmp.youtube.com";
     parsed_url.app = "app";
     parsed_url.key = "live_702512547_mCogJenh8dxfbsrIKa8KVA6axmoFii";
     parsed_url.url = "vie02.contribute.live-video.net";
