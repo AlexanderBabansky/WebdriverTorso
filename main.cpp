@@ -13,129 +13,17 @@
 #include "easyrtmp/rtmp_client_session.h"
 #include "easyrtmp/utils.h"
 #include "easyrtmp/rtmp_exception.h"
+#include <cassert>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
 #include <libavutil/opt.h>
 #include <libavutil/mem.h>
-
 #include <libavformat/avio.h>
-}
+#include <libavformat/avformat.h>
 
-extern "C" {
-    typedef struct NALU {
-        int offset;
-        uint32_t size;
-    } NALU;
-
-    typedef struct NALUList {
-        NALU* nalus;
-        unsigned nalus_array_size;
-        unsigned nb_nalus;          ///< valid entries in nalus
-    } NALUList;
-
-
-    static const uint8_t* avc_find_startcode_internal(const uint8_t* p, const uint8_t* end)
-    {
-        const uint8_t* a = p + 4 - ((intptr_t)p & 3);
-
-        for (end -= 3; p < a && p < end; p++) {
-            if (p[0] == 0 && p[1] == 0 && p[2] == 1)
-                return p;
-        }
-
-        for (end -= 3; p < end; p += 4) {
-            uint32_t x = *(const uint32_t*)p;
-            //      if ((x - 0x01000100) & (~x) & 0x80008000) // little endian
-            //      if ((x - 0x00010001) & (~x) & 0x00800080) // big endian
-            if ((x - 0x01010101) & (~x) & 0x80808080) { // generic
-                if (p[1] == 0) {
-                    if (p[0] == 0 && p[2] == 1)
-                        return p;
-                    if (p[2] == 0 && p[3] == 1)
-                        return p + 1;
-                }
-                if (p[3] == 0) {
-                    if (p[2] == 0 && p[4] == 1)
-                        return p + 2;
-                    if (p[4] == 0 && p[5] == 1)
-                        return p + 3;
-                }
-            }
-        }
-
-        for (end += 3; p < end; p++) {
-            if (p[0] == 0 && p[1] == 0 && p[2] == 1)
-                return p;
-        }
-
-        return end + 3;
-    }
-
-
-    const uint8_t* ff_avc_find_startcode(const uint8_t* p, const uint8_t* end) {
-        const uint8_t* out = avc_find_startcode_internal(p, end);
-        if (p < out && out < end && !out[-1]) out--;
-        return out;
-    }
-
-    static int avc_parse_nal_units(AVIOContext* pb, NALUList* list,
-        const uint8_t* buf_in, int size)
-    {
-        const uint8_t* p = buf_in;
-        const uint8_t* end = p + size;
-        const uint8_t* nal_start, * nal_end;
-
-        size = 0;
-        nal_start = ff_avc_find_startcode(p, end);
-        for (;;) {
-            const size_t nalu_limit = SIZE_MAX / sizeof(*list->nalus);
-            while (nal_start < end && !*(nal_start++));
-            if (nal_start == end)
-                break;
-
-            nal_end = ff_avc_find_startcode(nal_start, end);
-            if (pb) {
-                avio_wb32(pb, nal_end - nal_start);
-                avio_write(pb, nal_start, nal_end - nal_start);
-            }
-            else if (list->nb_nalus >= nalu_limit) {
-                return AVERROR(ERANGE);
-            }
-            else {
-
-                NALU* tmp = (NALU*)av_fast_realloc(list->nalus, &list->nalus_array_size,
-                    (list->nb_nalus + 1) * sizeof(*list->nalus));
-                if (!tmp)
-                    return AVERROR(ENOMEM);
-                list->nalus = tmp;
-                tmp[list->nb_nalus++] = {};
-                tmp[list->nb_nalus++].offset = nal_start - p;
-                tmp[list->nb_nalus++].size = nal_end - nal_start;
-            }
-            size += 4 + nal_end - nal_start;
-            nal_start = nal_end;
-        }
-        return size;
-    }
-
-    int ff_avc_parse_nal_units(AVIOContext* pb, const uint8_t* buf_in, int size)
-    {
-        return avc_parse_nal_units(pb, NULL, buf_in, size);
-    }
-
-    int ff_avc_parse_nal_units_buf(const uint8_t* buf_in, uint8_t** buf, int* size)
-    {
-        AVIOContext* pb;
-        int ret = avio_open_dyn_buf(&pb);
-        if (ret < 0)
-            return ret;
-
-        ff_avc_parse_nal_units(pb, buf_in, *size);
-
-        *size = avio_close_dyn_buf(pb, buf);
-        return 0;
-    }
+    int av_isom_write_avcc(AVIOContext* pb, const uint8_t* data, int len);
+    int av_avc_parse_nal_units_buf(const uint8_t* buf_in, uint8_t** buf, int* size);
 }
 
 using namespace std;
@@ -146,6 +34,14 @@ AVPacket* pkt_video = NULL;
 AVPacket* pkt_audio = NULL;
 AVFrame* frame_video = NULL;
 AVFrame* frame_audio = NULL;
+AVFormatContext* oc = NULL;
+
+
+
+static int write_packet(void* opaque, uint8_t* buf, int buf_size)
+{
+    return buf_size;
+}
 
 int init_video_codec(AVCodecContext* c, const AVCodec* codec) {
     /* put sample parameters */
@@ -172,6 +68,7 @@ int init_video_codec(AVCodecContext* c, const AVCodec* codec) {
         fprintf(stderr, "Could not open codec: %s\n", errbuf);
         exit(1);
     }
+
     return 0;
 }
 
@@ -242,6 +139,41 @@ int generate_audio_frame(AVFrame* frame, AVCodecContext* c) {
     return 0;
 }
 
+struct Rect {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+Rect blueRect;
+Rect redRect;
+
+Rect generate_rect(int width, int height) {
+    assert(width >= height);
+    int minWidth = height / 10;
+    int maxWidth = height / 2;
+
+    int w = rand() % (maxWidth - minWidth) + minWidth;
+    int h = rand() % (maxWidth - minWidth) + minWidth;
+
+    int x = rand() % (width - w);
+    int y = rand() % (height - h);
+
+    Rect res;
+    res.width = w;
+    res.height = h;
+    res.x = x;
+    res.y = y;
+    return res;
+}
+
+int change_rects(int width, int height) {
+    blueRect = generate_rect(width, height);
+    redRect = generate_rect(width, height);
+    return 0;
+}
+
 int generate_video_frame(AVFrame* frame, AVCodecContext* c, int i) {
     int ret = av_frame_make_writable(frame);
     if (ret < 0)
@@ -271,18 +203,26 @@ int output_video(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
     av_packet_rescale_ts(pkt, { c_video->time_base.num, c_video->time_base.den }, { 1,1000 });
     if (pkt->dts < 0)
         pkt->dts = 0;
+
+    uint8_t* data = pkt->data;
+    int size = pkt->size;
+    int ret = av_avc_parse_nal_units_buf(pkt->data, &data, &size);
+
     librtmp::RTMPMediaMessage mediaMsg;
     mediaMsg.message_type = librtmp::RTMPMessageType::VIDEO;
+    mediaMsg.message_stream_id = 1;
     mediaMsg.timestamp = pkt->dts;
     mediaMsg.video.d.avc_packet_type = 1;
     mediaMsg.video.d.composition_time = pkt->pts - pkt->dts;
-    mediaMsg.video.d.codec_id = (int)(librtmp::RTMPVideoCodec::AVC);
+    mediaMsg.video.d.codec_id = (uint8_t)(librtmp::RTMPVideoCodec::AVC);
     mediaMsg.video.d.frame_type = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 2;
-    mediaMsg.video.video_data_send.resize(pkt->size);
-    memcpy(mediaMsg.video.video_data_send.data(), pkt->data, pkt->size);
+    mediaMsg.video.video_data_send.resize(size);
+    memcpy(mediaMsg.video.video_data_send.data(), data, size);
     rtmp.SendRTMPMessage(mediaMsg);
     std::cout << "Out Video " << pkt->dts << endl;
     video_pts_ms = pkt->dts;
+
+    av_free(data);
     return 0;
 }
 
@@ -293,6 +233,7 @@ int output_audio(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
 
     librtmp::RTMPMediaMessage mediaMsg;
     mediaMsg.message_type = librtmp::RTMPMessageType::AUDIO;
+    mediaMsg.message_stream_id = 1;
     mediaMsg.timestamp = pkt->dts;
     mediaMsg.audio.aac_packet_type = 1;
     mediaMsg.audio.d.channels = 1;
@@ -322,11 +263,6 @@ int encode(AVFrame* frame, AVCodecContext* c, AVPacket* pkt, librtmp::RTMPClient
             fprintf(stderr, "Error during encoding\n");
             exit(1);
         }
-        uint8_t* data = NULL;
-        int size = pkt->size;
-
-        //ret = ff_avc_parse_nal_units_buf(pkt->data, &data, &size);
-        //av_free(data);
         output_video(pkt, rtmp);
         av_packet_unref(pkt);
     }
@@ -343,7 +279,7 @@ void init_network() {
     }
 }
 int main() {
-    std::cout << "Hello" << endl;
+    srand(time(NULL));
     init_network();
 
     init_codecs();
@@ -390,12 +326,22 @@ int main() {
     }
 
 
+
     librtmp::ParsedUrl parsed_url;
-    parsed_url.app = "live2";
-    parsed_url.key = "j0c0-v7xv-4kmb-gtu7-5r5p";
-    parsed_url.port = 1935;
     parsed_url.type = librtmp::ProtoType::RTMP;
-    parsed_url.url = "a.rtmp.youtube.com";
+    parsed_url.port = 1935;
+
+    /*parsed_url.app = "live2";
+    parsed_url.key = "key";
+    parsed_url.url = "127.0.0.1";*/
+
+    /*parsed_url.app = "live2";
+    parsed_url.key = "j0c0-v7xv-4kmb-gtu7-5r5p";
+    parsed_url.url = "a.rtmp.youtube.com";*/
+    parsed_url.app = "app";
+    parsed_url.key = "live_702512547_mCogJenh8dxfbsrIKa8KVA6axmoFii";
+    parsed_url.url = "vie02.contribute.live-video.net";
+
 
     TCPClient tcp_client;
     std::shared_ptr<TCPNetwork> tcp_network;
@@ -419,26 +365,40 @@ int main() {
         client_parameters.audio_codec = librtmp::RTMPAudioCodec::AAC;
         client_parameters.audio_datarate = c_audio->bit_rate / 1024;
         client_parameters.channels = c_audio->ch_layout.nb_channels;
-        client_parameters.samplesize = 32;
+        client_parameters.samplesize = 16;
         client_parameters.samplerate = c_audio->sample_rate;
         rtmp_client.SendClientParameters(&client_parameters);
 
         {
+            AVIOContext* avio_ctx = NULL;
+            uint8_t* buffer = NULL, * avio_ctx_buffer = NULL;
+            size_t buffer_size, avio_ctx_buffer_size = 4096;
+            avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
+            avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size,
+                1, NULL, NULL, &write_packet, NULL);
+            ret = av_isom_write_avcc(avio_ctx, c_video->extradata, c_video->extradata_size);
+
+            int s = avio_ctx->buf_ptr - avio_ctx->buffer;
+
             librtmp::RTMPMediaMessage mediaMsg;
             mediaMsg.message_type = librtmp::RTMPMessageType::VIDEO;
+            mediaMsg.message_stream_id = 1;
             mediaMsg.timestamp = 0;
             mediaMsg.video.d.avc_packet_type = 0;
             mediaMsg.video.d.codec_id = (int)(librtmp::RTMPVideoCodec::AVC);
             mediaMsg.video.d.frame_type = 1;
-            mediaMsg.video.video_data_send.resize(c_video->extradata_size);
-            memcpy(mediaMsg.video.video_data_send.data(), c_video->extradata,
-                c_video->extradata_size);
+            mediaMsg.video.video_data_send.resize(s);
+            memcpy(mediaMsg.video.video_data_send.data(), avio_ctx->buffer,
+                s);
             rtmp_client.SendRTMPMessage(mediaMsg);
+
+            //av_free(data);
         }
 
         {
             librtmp::RTMPMediaMessage mediaMsg;
             mediaMsg.message_type = librtmp::RTMPMessageType::AUDIO;
+            mediaMsg.message_stream_id = 1;
             mediaMsg.timestamp = 0;
             mediaMsg.audio.aac_packet_type = 0;
             mediaMsg.audio.d.channels = 1; //0 - mono, 1 - stereo
@@ -451,16 +411,20 @@ int main() {
                 c_audio->extradata, c_audio->extradata_size);
             rtmp_client.SendRTMPMessage(mediaMsg);
         }
-        
+
         chrono::high_resolution_clock::time_point start_time = chrono::high_resolution_clock::now();
         int64_t video_pts = 0;
         int64_t audio_pts = 0;
-        for (int i = 0;; i++) {            
-            if (video_pts % 25 == 0) {
-                //std::cout << "Send video frames " << i << endl;
+
+        change_rects(c_video->width, c_video->height);
+
+        int change_interval = 25;
+        for (;;) {
+            if (video_pts % change_interval == 0) {
+                change_rects(c_video->width, c_video->height);
             }
             if (video_pts_ms < audio_pts_ms) {
-                generate_video_frame(frame_video, c_video, i);
+                generate_video_frame(frame_video, c_video, video_pts);
                 frame_video->pts = video_pts;
                 video_pts++;
                 encode(frame_video, c_video, pkt_video, rtmp_client, &output_video);

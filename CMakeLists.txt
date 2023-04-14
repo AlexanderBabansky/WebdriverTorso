@@ -41,7 +41,21 @@ else()
 endif()
 
 
+list(APPEND DLLS "avcodec-60.dll")
+list(APPEND DLLS "avformat-60.dll")
+list(APPEND DLLS "avutil-58.dll")
+list(APPEND DLLS "swresample-4.dll")
+list(APPEND DLLS "swscale-7.dll")
+
+foreach(DLL ${DLLS})
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        ${IMPLIB_LOCATION}/${DLL}
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>)
+endforeach()
+
 add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different 
         ${easyrtmp_PACKAGE_FOLDER_DEBUG}/bin/easyrtmp.dll
         $<TARGET_FILE_DIR:${PROJECT_NAME}>)
+
