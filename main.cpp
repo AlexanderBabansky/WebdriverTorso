@@ -120,20 +120,19 @@ int init_codecs() {
 
 uint64_t t = 0;
 
-int generate_audio_frame(AVFrame* frame, AVCodecContext* c) {
+int generate_audio_frame(AVFrame* frame, float freq) {
     int ret = av_frame_make_writable(frame);
     if (ret < 0)
         exit(1);
-    float tincr = 2 * M_PI * 440.0 / c->sample_rate;
+    float tincr = 2 * M_PI * freq / frame->sample_rate;
 
-    for (int j = 0; j < c->frame_size; j++) {
+    for (int j = 0; j < frame->nb_samples; j++) {
         float v = (sin(t * tincr));
 
-        for (int k = 0; k < c->ch_layout.nb_channels; k++) {
+        for (int k = 0; k < frame->ch_layout.nb_channels; k++) {
             float* samples = (float*)frame->data[k];
             samples[j] = v;
         }
-
         t++;
     }
     return 0;
@@ -156,9 +155,13 @@ Rect generate_rect(int width, int height) {
 
     int w = rand() % (maxWidth - minWidth) + minWidth;
     int h = rand() % (maxWidth - minWidth) + minWidth;
+    w -= w % 2;
+    h -= h % 2;
 
     int x = rand() % (width - w);
     int y = rand() % (height - h);
+    x -= x % 2;
+    y -= y % 2;
 
     Rect res;
     res.width = w;
@@ -174,25 +177,46 @@ int change_rects(int width, int height) {
     return 0;
 }
 
-int generate_video_frame(AVFrame* frame, AVCodecContext* c, int i) {
+struct YUVColor {
+    int Y = 0;
+    int U = 0;
+    int V = 0;
+};
+
+YUVColor get_yuv_from_rgb(int R, int G, int B) {
+    int Y = 0.183f * R + 0.614f * G + 0.062f * B + 16;
+    int U = -0.101f * R - 0.338f * G + 0.439f * B + 128;
+    int V = 0.439f * R - 0.399f * G - 0.040f * B + 128;
+    YUVColor c;
+    c.Y = Y;
+    c.U = U;
+    c.V = V;
+    return c;
+}
+
+
+void clean_frame(AVFrame* frame) {
+    memset(frame->data[0], 255, frame->linesize[0] * frame->height);
+    memset(frame->data[1], 128, frame->linesize[1] * frame->height / 2);
+    memset(frame->data[2], 128, frame->linesize[2] * frame->height / 2);
+}
+
+void draw_rect_on_frame(AVFrame* frame, Rect rect, YUVColor color) {
+    for (int y = rect.y; y < rect.y + rect.height; y++, y++) {
+        memset(frame->data[0] + frame->linesize[0] * (y)+rect.x, color.Y, rect.width);
+        memset(frame->data[0] + frame->linesize[0] * (y + 1) + rect.x, color.Y, rect.width);
+        memset(frame->data[1] + (frame->linesize[1] * (y / 2)) + rect.x / 2, color.U, rect.width / 2);
+        memset(frame->data[2] + frame->linesize[2] * (y / 2) + rect.x / 2, color.V, rect.width / 2);
+    }
+}
+
+int generate_video_frame(AVFrame* frame, Rect blueRect) {
     int ret = av_frame_make_writable(frame);
     if (ret < 0)
         exit(1);
-
-    /* Y */
-    for (int y = 0; y < c->height; y++) {
-        for (int x = 0; x < c->width; x++) {
-            frame->data[0][y * frame->linesize[0] + x] = x + y + i * 3;
-        }
-    }
-
-    /* Cb and Cr */
-    for (int y = 0; y < c->height / 2; y++) {
-        for (int x = 0; x < c->width / 2; x++) {
-            frame->data[1][y * frame->linesize[1] + x] = 128 + y + i * 2;
-            frame->data[2][y * frame->linesize[2] + x] = 64 + x + i * 5;
-        }
-    }
+    clean_frame(frame);
+    draw_rect_on_frame(frame, blueRect, get_yuv_from_rgb(0, 0, 255));
+    draw_rect_on_frame(frame, redRect, get_yuv_from_rgb(255, 0, 0));
     return 0;
 }
 
@@ -219,9 +243,8 @@ int output_video(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
     mediaMsg.video.video_data_send.resize(size);
     memcpy(mediaMsg.video.video_data_send.data(), data, size);
     rtmp.SendRTMPMessage(mediaMsg);
-    std::cout << "Out Video " << pkt->dts << endl;
+    std::cout << "Out Video " << pkt->dts << endl;    
     video_pts_ms = pkt->dts;
-
     av_free(data);
     return 0;
 }
@@ -243,8 +266,9 @@ int output_audio(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
     mediaMsg.audio.audio_data_send.resize(pkt->size);
     memcpy(mediaMsg.audio.audio_data_send.data(), pkt->data, pkt->size);
     rtmp.SendRTMPMessage(mediaMsg);
-    std::cout << "Out Audio " << pkt->dts << endl;
+    std::cout << "Out Audio " << pkt->dts << endl;        
     audio_pts_ms = pkt->dts;
+
     return 0;
 }
 
@@ -314,6 +338,7 @@ int main() {
 
     frame_audio->nb_samples = c_audio->frame_size;
     frame_audio->format = c_audio->sample_fmt;
+    frame_audio->sample_rate = c_audio->sample_rate;
     ret = av_channel_layout_copy(&frame_audio->ch_layout, &c_audio->ch_layout);
     if (ret < 0)
         exit(1);
@@ -331,9 +356,9 @@ int main() {
     parsed_url.type = librtmp::ProtoType::RTMP;
     parsed_url.port = 1935;
 
-    /*parsed_url.app = "live2";
+    parsed_url.app = "live2";
     parsed_url.key = "key";
-    parsed_url.url = "127.0.0.1";*/
+    parsed_url.url = "127.0.0.1";
 
     /*parsed_url.app = "live2";
     parsed_url.key = "j0c0-v7xv-4kmb-gtu7-5r5p";
@@ -417,23 +442,28 @@ int main() {
         int64_t audio_pts = 0;
 
         change_rects(c_video->width, c_video->height);
+        float freq = 440;
 
         int change_interval = 25;
+        bool changed_frame = false;
         for (;;) {
-            if (video_pts % change_interval == 0) {
+            if (video_pts % change_interval == 0 && !changed_frame) {
                 change_rects(c_video->width, c_video->height);
+                generate_video_frame(frame_video, blueRect);
+                freq = rand() % 400 + 200;
+                changed_frame = true;
             }
             if (video_pts_ms < audio_pts_ms) {
-                generate_video_frame(frame_video, c_video, video_pts);
                 frame_video->pts = video_pts;
                 video_pts++;
-                encode(frame_video, c_video, pkt_video, rtmp_client, &output_video);
+                changed_frame = false;
+                encode(frame_video, c_video, pkt_video, rtmp_client, &output_video);                                
             }
             else {
-                generate_audio_frame(frame_audio, c_audio);
+                generate_audio_frame(frame_audio, freq);
                 frame_audio->pts = audio_pts;
                 audio_pts += c_audio->frame_size;
-                encode(frame_audio, c_audio, pkt_audio, rtmp_client, &output_audio);
+                encode(frame_audio, c_audio, pkt_audio, rtmp_client, &output_audio);                
             }
 
             int64_t elapsed_ms = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start_time).count();
