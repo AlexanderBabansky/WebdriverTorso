@@ -1,19 +1,10 @@
-#define WIN32_LEAN_AND_MEAN
-
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <stdlib.h>
-#include <stdio.h>
-
 #include <iostream>
 #include <chrono>
 #include <thread>
-#include "easyrtmp/data_layers/tcp_network.h"
-#include "easyrtmp/rtmp_client_session.h"
-#include "easyrtmp/utils.h"
-#include "easyrtmp/rtmp_exception.h"
 #include <cassert>
+#include <list>
+#include <mutex>
+#include <signal.h>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -21,9 +12,6 @@ extern "C" {
 #include <libavutil/mem.h>
 #include <libavformat/avio.h>
 #include <libavformat/avformat.h>
-
-    int av_isom_write_avcc(AVIOContext* pb, const uint8_t* data, int len);
-    int av_avc_parse_nal_units_buf(const uint8_t* buf_in, uint8_t** buf, int* size);
 }
 
 using namespace std;
@@ -34,14 +22,24 @@ AVPacket* pkt_video = NULL;
 AVPacket* pkt_audio = NULL;
 AVFrame* frame_video = NULL;
 AVFrame* frame_audio = NULL;
+AVStream* stream_video = NULL;
+AVStream* stream_audio = NULL;
 AVFormatContext* oc = NULL;
+std::mutex packets_mutex;
+std::list<AVPacket*> packets_video;
+std::list<AVPacket*> packets_audio;
+std::condition_variable packets_cv;
 
+bool verbose = true;
+std::atomic_bool stop_flag = false;
 
-
-static int write_packet(void* opaque, uint8_t* buf, int buf_size)
+void sigintHandler(int sig_num)
 {
-    return buf_size;
+    signal(SIGINT, sigintHandler);
+    printf("\n Terminating with Ctrl+C \n");
+    stop_flag = true;
 }
+
 
 int init_video_codec(AVCodecContext* c, const AVCodec* codec) {
     /* put sample parameters */
@@ -53,13 +51,13 @@ int init_video_codec(AVCodecContext* c, const AVCodec* codec) {
     c->time_base = { 1, 25 };
     c->framerate = { 25, 1 };
 
-    //c->gop_size = 10;
-    //c->max_b_frames = 1;
+    c->gop_size = 10;
+    c->max_b_frames = 1;
     c->pix_fmt = AV_PIX_FMT_YUV420P;
     c->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
-    //if (codec->id == AV_CODEC_ID_H264)
-        //av_opt_set(c->priv_data, "preset", "veryfast", 0);
+    if (codec->id == AV_CODEC_ID_H264)
+        av_opt_set(c->priv_data, "preset", "veryfast", 0);
 
     int ret = avcodec_open2(c, codec, NULL);
     if (ret < 0) {
@@ -89,8 +87,14 @@ int init_audio_codec(AVCodecContext* c, const AVCodec* codec) {
     return 0;
 }
 
+void free_codecs() {
+    avcodec_free_context(&c_video);
+    avcodec_free_context(&c_audio);
+}
+
 int init_codecs() {
     const AVCodec* codec_video = avcodec_find_encoder(AV_CODEC_ID_H264);
+    //codec_video = avcodec_find_encoder_by_name("libopenh264");
     if (!codec_video) {
         fprintf(stderr, "Codec '%s' not found\n", "aac");
         exit(1);
@@ -220,59 +224,25 @@ int generate_video_frame(AVFrame* frame, Rect blueRect) {
     return 0;
 }
 
-int64_t video_pts_ms = 0;
-int64_t audio_pts_ms = 0;
-
-int output_video(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
+int output_video(AVPacket* pkt) {
     av_packet_rescale_ts(pkt, { c_video->time_base.num, c_video->time_base.den }, { 1,1000 });
-    if (pkt->dts < 0)
-        pkt->dts = 0;
-
-    uint8_t* data = NULL;
-    int size = pkt->size;
-    int ret = av_avc_parse_nal_units_buf(pkt->data, &data, &size);
-
-    librtmp::RTMPMediaMessage mediaMsg;
-    mediaMsg.message_type = librtmp::RTMPMessageType::VIDEO;
-    mediaMsg.message_stream_id = 1;
-    mediaMsg.timestamp = pkt->dts;
-    mediaMsg.video.d.avc_packet_type = 1;
-    mediaMsg.video.d.composition_time = pkt->pts - pkt->dts;
-    mediaMsg.video.d.codec_id = (uint8_t)(librtmp::RTMPVideoCodec::AVC);
-    mediaMsg.video.d.frame_type = (pkt->flags & AV_PKT_FLAG_KEY) ? 1 : 2;
-    mediaMsg.video.video_data_send.resize(size);
-    memcpy(mediaMsg.video.video_data_send.data(), data, size);
-    rtmp.SendRTMPMessage(mediaMsg);
-    std::cout << "Out Video " << pkt->dts << endl;    
-    video_pts_ms = pkt->dts;
-    av_free(data);
+    AVPacket* pkt_copy = av_packet_clone(pkt);
+    std::unique_lock<std::mutex> g(packets_mutex);
+    packets_video.push_back(pkt_copy);
+    packets_cv.notify_one();
     return 0;
 }
 
-int output_audio(AVPacket* pkt, librtmp::RTMPClientSession& rtmp) {
+int output_audio(AVPacket* pkt) {
     av_packet_rescale_ts(pkt, { c_audio->time_base.num, c_audio->time_base.den }, { 1,1000 });
-    if (pkt->dts < 0)
-        pkt->dts = 0;
-
-    librtmp::RTMPMediaMessage mediaMsg;
-    mediaMsg.message_type = librtmp::RTMPMessageType::AUDIO;
-    mediaMsg.message_stream_id = 1;
-    mediaMsg.timestamp = pkt->dts;
-    mediaMsg.audio.aac_packet_type = 1;
-    mediaMsg.audio.d.channels = 1;
-    mediaMsg.audio.d.format = (int)librtmp::RTMPAudioCodec::AAC;
-    mediaMsg.audio.d.sample_rate = 3;
-    mediaMsg.audio.d.sample_size = 1;
-    mediaMsg.audio.audio_data_send.resize(pkt->size);
-    memcpy(mediaMsg.audio.audio_data_send.data(), pkt->data, pkt->size);
-    rtmp.SendRTMPMessage(mediaMsg);
-    std::cout << "Out Audio " << pkt->dts << endl;        
-    audio_pts_ms = pkt->dts;
-
+    AVPacket* pkt_copy = av_packet_clone(pkt);
+    std::unique_lock<std::mutex> g(packets_mutex);
+    packets_audio.push_back(pkt_copy);
+    packets_cv.notify_one();
     return 0;
 }
 
-int encode(AVFrame* frame, AVCodecContext* c, AVPacket* pkt, librtmp::RTMPClientSession& rtmp, int (*output_video)(AVPacket*, librtmp::RTMPClientSession&)) {
+int encode(AVFrame* frame, AVCodecContext* c, AVPacket* pkt, int (*output_video)(AVPacket*)) {
     int ret = avcodec_send_frame(c, frame);
     if (ret < 0) {
         fprintf(stderr, "Error sending a frame for encoding\n");
@@ -287,55 +257,103 @@ int encode(AVFrame* frame, AVCodecContext* c, AVPacket* pkt, librtmp::RTMPClient
             fprintf(stderr, "Error during encoding\n");
             exit(1);
         }
-        output_video(pkt, rtmp);
+        output_video(pkt);
         av_packet_unref(pkt);
     }
     return 0;
 }
 
-WSADATA wsaData;
-
-void init_network() {
-    int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (iResult != 0) {
-        printf("WSAStartup failed with error: %d\n", iResult);
-        exit(1);
-    }
+std::string getLibavError(int c) {
+    char errbuf[200];
+    av_make_error_string(errbuf, 200, c);
+    return errbuf;
 }
-int main() {
-    srand(time(NULL));
-    init_network();
 
+int network_thread(std::atomic_bool* stop_flag, std::atomic_bool* err_flag) {
+    while (*stop_flag == false) {
+        std::unique_lock<std::mutex> g(packets_mutex);
+        while (*stop_flag == false && (packets_audio.empty() || packets_video.empty())) {
+            packets_cv.wait(g);
+            continue;
+        }
+        if (*stop_flag)
+            break;
+
+        AVPacket* pkt_audio = packets_audio.front();
+        AVPacket* pkt_video = packets_video.front();
+
+        pkt_video->stream_index = stream_video->id;
+        pkt_audio->stream_index = stream_audio->id;
+
+        if (pkt_audio->dts < pkt_video->dts) {
+            if (verbose) {
+                printf("Send audio packet. dts: %d\n", pkt_audio->dts);
+            }
+            int ret = av_interleaved_write_frame(oc, pkt_audio);
+            if (ret < 0) {
+                fprintf(stderr, "Error sending audio packet\n");
+                *err_flag = true;
+                return 1;
+            }
+            packets_audio.pop_front();
+            av_packet_free(&pkt_audio);
+        }
+        else {
+            if (verbose) {
+                printf("Send video packet. dts: %d\n", pkt_video->dts);
+            }
+            int ret = av_interleaved_write_frame(oc, pkt_video);
+            if (ret < 0) {
+                fprintf(stderr, "Error sending video packet\n");
+                *err_flag = true;
+                return 1;
+            }
+            packets_video.pop_front();
+            av_packet_free(&pkt_video);
+        }
+    }
+    return 0;
+}
+
+int64_t get_avframe_pts_ms(AVFrame* frame, AVRational time_base) {
+    return 1000 * frame->pts * time_base.num / time_base.den;
+}
+
+int main(int argc, char** argv) {
+    signal(SIGINT, sigintHandler);
+    srand(time(NULL));
+
+    if (argc != 2) {
+        printf("Need url\n");
+        return 1;
+    }
+    const char* url = argv[1];
     init_codecs();
+    if (verbose) {
+        printf("Inited encoders\n");
+    }
 
     pkt_video = av_packet_alloc();
     pkt_audio = av_packet_alloc();
-    if (!pkt_video)
-        exit(1);
-    if (!pkt_audio)
-        exit(1);
+    if (!pkt_video || !pkt_audio)
+        return 1;
 
     frame_video = av_frame_alloc();
     frame_audio = av_frame_alloc();
-    if (!frame_video) {
-        fprintf(stderr, "Could not allocate video frame\n");
-        exit(1);
-    }
-    if (!frame_audio) {
-        fprintf(stderr, "Could not allocate audio frame\n");
-        exit(1);
-    }
+    if (!frame_video || !frame_audio)
+        return 1;
 
     frame_video->format = c_video->pix_fmt;
     frame_video->width = c_video->width;
     frame_video->height = c_video->height;
+    frame_video->pts = 0;
     int ret = av_frame_get_buffer(frame_video, 0);
     if (ret < 0) {
         fprintf(stderr, "Could not allocate the video frame data\n");
-        exit(1);
+        return 1;
     }
 
-
+    frame_audio->pts = 0;
     frame_audio->nb_samples = c_audio->frame_size;
     frame_audio->format = c_audio->sample_fmt;
     frame_audio->sample_rate = c_audio->sample_rate;
@@ -350,137 +368,124 @@ int main() {
         exit(1);
     }
 
-
-
-    librtmp::ParsedUrl parsed_url;
-    parsed_url.type = librtmp::ProtoType::RTMP;
-    parsed_url.port = 1935;
-
-    parsed_url.app = "live2";
-    parsed_url.key = "key";
-    parsed_url.url = "127.0.0.1";
-
-    parsed_url.app = "live2";
-    parsed_url.key = "j0c0-v7xv-4kmb-gtu7-5r5p";
-    parsed_url.url = "a.rtmp.youtube.com";
-    parsed_url.app = "app";
-    parsed_url.key = "live_702512547_mCogJenh8dxfbsrIKa8KVA6axmoFii";
-    parsed_url.url = "vie02.contribute.live-video.net";
-
-
-    TCPClient tcp_client;
-    std::shared_ptr<TCPNetwork> tcp_network;
-
-    try {
-        tcp_network = tcp_client.ConnectToHost(parsed_url.url.c_str(), parsed_url.port);
-        librtmp::RTMPEndpoint rtmp_endpoint(tcp_network.get());
-        librtmp::RTMPClientSession rtmp_client(&rtmp_endpoint);
-
-        librtmp::ClientParameters client_parameters;
-        client_parameters.app = parsed_url.app;
-        client_parameters.url = parsed_url.url;
-        client_parameters.key = parsed_url.key;
-        client_parameters.has_video = true;
-        client_parameters.width = c_video->width;
-        client_parameters.height = c_video->height;
-        client_parameters.video_datarate = c_video->bit_rate / 1024;
-        client_parameters.framerate = c_video->framerate.num / c_video->framerate.den;
-        client_parameters.video_codec = librtmp::RTMPVideoCodec::AVC;
-        client_parameters.has_audio = true;
-        client_parameters.audio_codec = librtmp::RTMPAudioCodec::AAC;
-        client_parameters.audio_datarate = c_audio->bit_rate / 1024;
-        client_parameters.channels = c_audio->ch_layout.nb_channels;
-        client_parameters.samplesize = 16;
-        client_parameters.samplerate = c_audio->sample_rate;
-        rtmp_client.SendClientParameters(&client_parameters);
-
-        {
-            AVIOContext* avio_ctx = NULL;
-            uint8_t* buffer = NULL, * avio_ctx_buffer = NULL;
-            size_t buffer_size, avio_ctx_buffer_size = 4096;
-            avio_ctx_buffer = (uint8_t*)av_malloc(avio_ctx_buffer_size);
-            avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size,
-                1, NULL, NULL, &write_packet, NULL);
-            ret = av_isom_write_avcc(avio_ctx, c_video->extradata, c_video->extradata_size);
-
-            int s = avio_ctx->buf_ptr - avio_ctx->buffer;
-
-            librtmp::RTMPMediaMessage mediaMsg;
-            mediaMsg.message_type = librtmp::RTMPMessageType::VIDEO;
-            mediaMsg.message_stream_id = 1;
-            mediaMsg.timestamp = 0;
-            mediaMsg.video.d.avc_packet_type = 0;
-            mediaMsg.video.d.codec_id = (int)(librtmp::RTMPVideoCodec::AVC);
-            mediaMsg.video.d.frame_type = 1;
-            mediaMsg.video.video_data_send.resize(s);
-            memcpy(mediaMsg.video.video_data_send.data(), avio_ctx->buffer,
-                s);
-            rtmp_client.SendRTMPMessage(mediaMsg);
-
-            //av_free(data);
-        }
-
-        {
-            librtmp::RTMPMediaMessage mediaMsg;
-            mediaMsg.message_type = librtmp::RTMPMessageType::AUDIO;
-            mediaMsg.message_stream_id = 1;
-            mediaMsg.timestamp = 0;
-            mediaMsg.audio.aac_packet_type = 0;
-            mediaMsg.audio.d.channels = 1; //0 - mono, 1 - stereo
-            mediaMsg.audio.d.format = (int)librtmp::RTMPAudioCodec::AAC;
-            mediaMsg.audio.d.sample_rate
-                = 3; //0 - 5.5 Khz, 1 - 11 Khz, 2 - 22 Khz, 3 - 44 KHz
-            mediaMsg.audio.d.sample_size = 1; //0 - 8 bit, 1 - 16 bit
-            mediaMsg.audio.audio_data_send.resize(c_audio->extradata_size);
-            memcpy(mediaMsg.audio.audio_data_send.data(),
-                c_audio->extradata, c_audio->extradata_size);
-            rtmp_client.SendRTMPMessage(mediaMsg);
-        }
-
-        chrono::high_resolution_clock::time_point start_time = chrono::high_resolution_clock::now();
-        int64_t video_pts = 0;
-        int64_t audio_pts = 0;
-
-        change_rects(c_video->width, c_video->height);
-        float freq = 440;
-
-        int change_interval = 25;
-        bool changed_frame = false;
-        for (;;) {
-            if (video_pts % change_interval == 0 && !changed_frame) {
-                change_rects(c_video->width, c_video->height);
-                generate_video_frame(frame_video, blueRect);
-                freq = rand() % 400 + 200;
-                changed_frame = true;
-            }
-            if (video_pts_ms < audio_pts_ms) {
-                frame_video->pts = video_pts;
-                video_pts++;
-                changed_frame = false;
-                encode(frame_video, c_video, pkt_video, rtmp_client, &output_video);                                
-            }
-            else {
-                generate_audio_frame(frame_audio, freq);
-                frame_audio->pts = audio_pts;
-                audio_pts += c_audio->frame_size;
-                encode(frame_audio, c_audio, pkt_audio, rtmp_client, &output_audio);                
-            }
-
-            int64_t elapsed_ms = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start_time).count();
-            if (video_pts_ms > elapsed_ms) {
-                this_thread::sleep_for(chrono::milliseconds(video_pts_ms - elapsed_ms));
-            }
-        }
-
-    }
-    catch (TCPNetworkException& e) {
-        std::cout << "Connection error: " << e.what() << endl;
+    if (avformat_alloc_output_context2(&oc, NULL, "flv", url) < 0) {
+        fprintf(stderr, "Could not allocate output context\n");
         return 1;
     }
-    catch (std::exception& e) {
-        std::cout << "Unexpected error: " << e.what() << endl;
+    stream_video = avformat_new_stream(oc, NULL);
+    if (!stream_video) {
+        fprintf(stderr, "Could not allocate stream\n");
+        exit(1);
+    }
+    stream_video->id = oc->nb_streams - 1;
+
+    stream_audio = avformat_new_stream(oc, NULL);
+    if (!stream_audio) {
+        fprintf(stderr, "Could not allocate stream\n");
+        return 1;
+    }
+    stream_audio->id = oc->nb_streams - 1;
+
+    if (avcodec_parameters_from_context(stream_video->codecpar, c_video) < 0) {
+        fprintf(stderr, "Could not copy codec parameters\n");
+        return 1;
+    }
+    if (avcodec_parameters_from_context(stream_audio->codecpar, c_audio) < 0) {
+        fprintf(stderr, "Could not copy codec parameters\n");
         return 1;
     }
 
+    if (verbose) {
+        printf("Try to connect...\n");
+    }
+    ret = avio_open(&oc->pb, url, AVIO_FLAG_WRITE);
+    if (ret < 0) {
+        fprintf(stderr, "Could not open filename '%s': %s\n", url,
+            getLibavError(ret).c_str());
+        return 1;
+    }
+    if (verbose) {
+        printf("Connected\n");
+    }
+
+    AVDictionary* opt = NULL;
+    ret = avformat_write_header(oc, &opt);
+    if (ret < 0) {
+        fprintf(stderr, "Error occurred when opening output file: %s\n",
+            getLibavError(ret).c_str());
+        return 1;
+    }
+
+    std::atomic_bool err_flag = false;
+    std::thread th(network_thread, &stop_flag, &err_flag);
+
+
+    change_rects(c_video->width, c_video->height);
+    float freq = 440;
+
+    int change_interval = 25;
+    bool changed_frame = false;
+    int64_t video_pts_ms = -1000;
+    int64_t audio_pts_ms = -1000;
+    chrono::high_resolution_clock::time_point start_time = chrono::high_resolution_clock::now();
+
+    for (;;) {
+        if (stop_flag) {
+            break;
+        }
+        if (err_flag) {
+            fprintf(stderr, "Error occurred in network thread\n");
+            break;
+        }
+        if (frame_video->pts % change_interval == 0 && !changed_frame) {
+            change_rects(c_video->width, c_video->height);
+            generate_video_frame(frame_video, blueRect);
+            freq = rand() % 400 + 200;
+            changed_frame = true;
+        }
+        if (video_pts_ms < audio_pts_ms) {
+            changed_frame = false;
+            encode(frame_video, c_video, pkt_video, &output_video);
+            frame_video->pts++;
+            video_pts_ms = get_avframe_pts_ms(frame_video, c_video->time_base);
+        }
+        else {
+            generate_audio_frame(frame_audio, freq);
+            encode(frame_audio, c_audio, pkt_audio, &output_audio);
+            frame_audio->pts += c_audio->frame_size;
+            audio_pts_ms = get_avframe_pts_ms(frame_audio, c_audio->time_base);
+        }
+
+        int64_t elapsed_ms = chrono::duration_cast<chrono::milliseconds>(chrono::high_resolution_clock::now() - start_time).count();
+        if (video_pts_ms > elapsed_ms) {
+            this_thread::sleep_for(chrono::milliseconds(video_pts_ms - elapsed_ms));
+        }
+    }
+
+    if (verbose) {
+        printf("Terminating...\n");
+    }
+
+    stop_flag = true;
+    {
+        std::unique_lock<std::mutex> g(packets_mutex);
+        packets_cv.notify_one();
+    }
+    th.join();
+    free_codecs();
+    av_packet_free(&pkt_video);
+    av_packet_free(&pkt_audio);
+    av_frame_free(&frame_video);
+    av_frame_free(&frame_audio);
+    avio_closep(&oc->pb);
+    avformat_free_context(oc);
+    for (auto& p : packets_audio) {
+        av_packet_free(&p);
+    }
+    for (auto& p : packets_video) {
+        av_packet_free(&p);
+    }
+    packets_audio.clear();
+    packets_video.clear();
     return 0;
 }
