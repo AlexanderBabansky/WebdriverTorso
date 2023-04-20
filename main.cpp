@@ -238,7 +238,7 @@ int output_video(AVPacket* pkt) {
     av_packet_rescale_ts(pkt, { c_video->time_base.num, c_video->time_base.den }, { 1,1000 });
     AVPacket* pkt_copy = av_packet_clone(pkt);
     std::unique_lock<std::mutex> g(packets_mutex);
-    packets_video.push_back(pkt_copy);    
+    packets_video.push_back(pkt_copy);
     packets_cv.notify_one();
     return 0;
 }
@@ -282,7 +282,7 @@ std::string getLibavError(int c) {
 int network_thread(std::atomic_bool* stop_flag, std::atomic_bool* err_flag) {
     while (*stop_flag == false) {
         std::unique_lock<std::mutex> g(packets_mutex);
-        while (*stop_flag == false && (packets_audio.empty() || packets_video.empty())) {
+        while (*stop_flag == false && (packets_audio.size() < 2 || packets_video.size() < 2)) {
             packets_cv.wait(g);
             continue;
         }
@@ -299,26 +299,31 @@ int network_thread(std::atomic_bool* stop_flag, std::atomic_bool* err_flag) {
             if (verbose) {
                 printf("Send audio packet. dts: %ld\n", pkt_audio->dts);
             }
+            packets_audio.pop_front();
+            AVPacket* next_pkt = packets_audio.front();
+            pkt_audio->duration = next_pkt->dts - pkt_audio->dts;            
             int ret = av_interleaved_write_frame(oc, pkt_audio);
             if (ret < 0) {
                 fprintf(stderr, "Error sending audio packet\n");
                 *err_flag = true;
                 return 1;
-            }
-            packets_audio.pop_front();
+            }            
             av_packet_free(&pkt_audio);
         }
         else {
             if (verbose) {
                 printf("Send video packet. dts: %ld\n", pkt_video->dts);
             }
+            packets_video.pop_front();
+            AVPacket* next_pkt = packets_video.front();
+            pkt_video->duration = next_pkt->dts - pkt_video->dts;
+
             int ret = av_interleaved_write_frame(oc, pkt_video);
             if (ret < 0) {
                 fprintf(stderr, "Error sending video packet\n");
                 *err_flag = true;
                 return 1;
             }
-            packets_video.pop_front();
             av_packet_free(&pkt_video);
         }
     }
@@ -344,10 +349,10 @@ enum Proto {
     RTMP,
     HLS
 };
-enum Proto protocol = Proto::RTMP;
+enum Proto protocol = Proto::HLS;
 
 int main(int argc, char** argv) {
-    //signal(SIGINT, sigintHandler);
+    signal(SIGINT, sigintHandler);
     srand(time(NULL));
     stop_flag = false;
 
@@ -362,6 +367,9 @@ int main(int argc, char** argv) {
     }
     if (string_begin_with(url, "http")) {
         protocol = Proto::HLS;
+    }
+    else {
+        protocol = Proto::RTMP;
     }
 
     init_codecs();
@@ -456,12 +464,20 @@ int main(int argc, char** argv) {
         printf("Connected\n");
     }
 
-    AVDictionary* opt = NULL;
+    AVDictionary* opt = NULL;    
+    av_dict_set_int(&opt, "hls_time", 1, 0);
+
     ret = avformat_write_header(oc, &opt);
     if (ret < 0) {
         fprintf(stderr, "Error occurred when opening output file: %s\n",
             getLibavError(ret).c_str());
         return 1;
+    }
+    if (protocol == Proto::HLS) {
+        if (ret < 0) {
+            fprintf(stderr, "Error occurred when setting HLS param\n");
+            return 1;
+        }
     }
 
     std::atomic_bool err_flag;
