@@ -238,7 +238,7 @@ int output_video(AVPacket* pkt) {
     av_packet_rescale_ts(pkt, { c_video->time_base.num, c_video->time_base.den }, { 1,1000 });
     AVPacket* pkt_copy = av_packet_clone(pkt);
     std::unique_lock<std::mutex> g(packets_mutex);
-    packets_video.push_back(pkt_copy);
+    packets_video.push_back(pkt_copy);    
     packets_cv.notify_one();
     return 0;
 }
@@ -329,8 +329,25 @@ int64_t get_avframe_pts_ms(AVFrame* frame, AVRational time_base) {
     return 1000 * frame->pts * time_base.num / time_base.den;
 }
 
+bool string_begin_with(const char* str, const char* word) {
+    int wordlen = strlen(word);
+    if (strlen(str) < wordlen)
+        return false;
+    for (int a = 0; a < wordlen; a++) {
+        if (str[a] != word[a])
+            return false;
+    }
+    return true;
+}
+
+enum Proto {
+    RTMP,
+    HLS
+};
+enum Proto protocol = Proto::RTMP;
+
 int main(int argc, char** argv) {
-    signal(SIGINT, sigintHandler);
+    //signal(SIGINT, sigintHandler);
     srand(time(NULL));
     stop_flag = false;
 
@@ -339,6 +356,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     const char* url = argv[1];
+    if (strlen(url) < 7) {
+        printf("Bad url\n");
+        return 1;
+    }
+    if (string_begin_with(url, "http")) {
+        protocol = Proto::HLS;
+    }
+
     init_codecs();
     if (verbose) {
         printf("Inited encoders\n");
@@ -379,7 +404,19 @@ int main(int argc, char** argv) {
         exit(1);
     }
 
-    if (avformat_alloc_output_context2(&oc, NULL, "flv", url) < 0) {
+    const char* libavformat = NULL;
+    if (protocol == Proto::RTMP) {
+        libavformat = "flv";
+    }
+    else if (protocol == Proto::HLS) {
+        libavformat = "hls";
+    }
+    else {
+        fprintf(stderr, "Protocol not implemented\n");
+        return 1;
+    }
+
+    if (avformat_alloc_output_context2(&oc, NULL, libavformat, url) < 0) {
         fprintf(stderr, "Could not allocate output context\n");
         return 1;
     }
