@@ -5,6 +5,9 @@
 #include <list>
 #include <mutex>
 #include <signal.h>
+#include <condition_variable>
+#include <atomic>
+#include <cmath>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -31,7 +34,7 @@ std::list<AVPacket*> packets_audio;
 std::condition_variable packets_cv;
 
 bool verbose = true;
-std::atomic_bool stop_flag = false;
+std::atomic_bool stop_flag;
 
 void sigintHandler(int sig_num)
 {
@@ -153,9 +156,16 @@ Rect blueRect;
 Rect redRect;
 
 Rect generate_rect(int width, int height) {
-    assert(width >= height);
-    int minWidth = height / 10;
-    int maxWidth = height / 2;
+    int minWidth = 0;
+    int maxWidth = 0;
+    if (width >= height) {
+        minWidth = height / 10;
+        maxWidth = height / 2;
+    }
+    else {
+        minWidth = width / 10;
+        maxWidth = width / 2;
+    }
 
     int w = rand() % (maxWidth - minWidth) + minWidth;
     int h = rand() % (maxWidth - minWidth) + minWidth;
@@ -287,7 +297,7 @@ int network_thread(std::atomic_bool* stop_flag, std::atomic_bool* err_flag) {
 
         if (pkt_audio->dts < pkt_video->dts) {
             if (verbose) {
-                printf("Send audio packet. dts: %d\n", pkt_audio->dts);
+                printf("Send audio packet. dts: %ld\n", pkt_audio->dts);
             }
             int ret = av_interleaved_write_frame(oc, pkt_audio);
             if (ret < 0) {
@@ -300,7 +310,7 @@ int network_thread(std::atomic_bool* stop_flag, std::atomic_bool* err_flag) {
         }
         else {
             if (verbose) {
-                printf("Send video packet. dts: %d\n", pkt_video->dts);
+                printf("Send video packet. dts: %ld\n", pkt_video->dts);
             }
             int ret = av_interleaved_write_frame(oc, pkt_video);
             if (ret < 0) {
@@ -322,6 +332,7 @@ int64_t get_avframe_pts_ms(AVFrame* frame, AVRational time_base) {
 int main(int argc, char** argv) {
     signal(SIGINT, sigintHandler);
     srand(time(NULL));
+    stop_flag = false;
 
     if (argc != 2) {
         printf("Need url\n");
@@ -416,7 +427,8 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::atomic_bool err_flag = false;
+    std::atomic_bool err_flag;
+    err_flag = false;
     std::thread th(network_thread, &stop_flag, &err_flag);
 
 

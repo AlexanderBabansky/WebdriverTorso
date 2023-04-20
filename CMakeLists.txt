@@ -6,8 +6,13 @@ project(webdrivertorso VERSION ${webdrivertorso_VERSION})
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-set (LIBAV_EXT_PATH "" CACHE PATH "Libav filepath")
-set (IMPLIB_LOCATION ${LIBAV_EXT_PATH}/bin)
+if (WIN32)
+    set (LIBAV_EXT_PATH "" CACHE PATH "Libav filepath")
+    set (IMPLIB_LOCATION ${LIBAV_EXT_PATH}/bin/)
+    set (POSTFIX ".lib")
+else()
+    #set (IMPLIB_LOCATION "")
+endif()
 
 add_executable(${PROJECT_NAME})
 
@@ -16,15 +21,11 @@ target_sources(${PROJECT_NAME} PRIVATE
     )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    ${IMPLIB_LOCATION}/avcodec.lib
-    ${IMPLIB_LOCATION}/avformat.lib
-    ${IMPLIB_LOCATION}/avutil.lib
-    ${IMPLIB_LOCATION}/swresample.lib
-    ${IMPLIB_LOCATION}/swscale.lib
-)
-
-target_include_directories(${PROJECT_NAME} PRIVATE
-    ${LIBAV_EXT_PATH}/include
+    ${IMPLIB_LOCATION}avcodec${POSTFIX}
+    ${IMPLIB_LOCATION}avformat${POSTFIX}
+    ${IMPLIB_LOCATION}avutil${POSTFIX}
+    ${IMPLIB_LOCATION}swresample${POSTFIX}
+    ${IMPLIB_LOCATION}swscale${POSTFIX}
 )
 
 if (NOT WIN32)
@@ -32,21 +33,25 @@ if (NOT WIN32)
         pthread
         )
 else()
+    target_include_directories(${PROJECT_NAME} PRIVATE
+        ${LIBAV_EXT_PATH}/include
+    )
     target_link_libraries(${PROJECT_NAME} PRIVATE
         Ws2_32.lib
         )
 endif()
 
+if (WIN32)
+    list(APPEND DLLS "avcodec-60.dll")
+    list(APPEND DLLS "avformat-60.dll")
+    list(APPEND DLLS "avutil-58.dll")
+    list(APPEND DLLS "swresample-4.dll")
+    list(APPEND DLLS "swscale-7.dll")
 
-list(APPEND DLLS "avcodec-60.dll")
-list(APPEND DLLS "avformat-60.dll")
-list(APPEND DLLS "avutil-58.dll")
-list(APPEND DLLS "swresample-4.dll")
-list(APPEND DLLS "swscale-7.dll")
-
-foreach(DLL ${DLLS})
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
-        ${IMPLIB_LOCATION}/${DLL}
-        $<TARGET_FILE_DIR:${PROJECT_NAME}>)
-endforeach()
+    foreach(DLL ${DLLS})
+        add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+            ${IMPLIB_LOCATION}/${DLL}
+            $<TARGET_FILE_DIR:${PROJECT_NAME}>)
+    endforeach()
+endif()
